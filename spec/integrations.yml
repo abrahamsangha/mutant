@@ -8,6 +8,7 @@
   expected_errors:
     language/regexp/escapes_spec.rb: "#<RegexpError: invalid multibyte escape: /\\xAA/>"
     core/symbol/casecmp_spec.rb: "#<EncodingError: invalid encoding symbol>"
+    language/regexp/interpolation_spec.rb: "#<Regexp::Scanner::PrematureEndError: Premature end of pattern at #{str}>"
 - name: auom
   namespace: AUOM
   repo_uri: 'https://github.com/mbj/auom.git'
