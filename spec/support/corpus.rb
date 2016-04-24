@@ -33,7 +33,7 @@ module MutantSpec
 
       include Adamantium, Anima.new(
         :expect_coverage,
-        :permitted_errors,
+        :expected_errors,
         :mutation_coverage,
         :mutation_generation,
         :name,
@@ -84,7 +84,7 @@ module MutantSpec
         }
 
         total = Parallel.map(effective_ruby_paths, options) do |path|
-          filter_exceptions(path, DEFAULT_MUTATION_COUNT) { count_mutations(path) }
+          count_mutations_and_check_errors(path)
         end.inject(0, :+)
 
         took = Time.now - start
@@ -116,6 +116,27 @@ module MutantSpec
 
     private
 
+      MissingExpectedException = Class.new(StandardError)
+
+      # Count mutations and check error results against whitelist
+      #
+      # @param path [Pathname] path responsible for exception
+      #
+      # @return [Fixnum] mutations generated
+      def count_mutations_and_check_errors(path)
+        relative_path = path.relative_path_from(repo_path)
+
+        count = count_mutations(path)
+
+        expected_errors.assert_success(relative_path)
+
+        count
+      rescue Exception => exception # rubocop:disable Lint/RescueException
+        expected_errors.assert_error(relative_path, exception)
+
+        DEFAULT_MUTATION_COUNT
+      end
+
       # Count mutations generated for provided source file
       #
       # @param path [Pathname] path to a source file
@@ -127,39 +148,6 @@ module MutantSpec
         return DEFAULT_MUTATION_COUNT unless node
 
         Mutant::Mutator::REGISTRY.call(node).length
-      end
-
-      # Yield and conditionally suppress errors according to whitelist
-      #
-      # @param path [Pathname] path responsible for exception
-      # @param default_return [Object] return value if exception is permitted
-      #
-      # @return value returned from yield if no exception raised
-      # @return `default_return` otherwise
-      def filter_exceptions(path, default_return)
-        yield
-      rescue Exception => exception # rubocop:disable Lint/RescueException
-        raise exception unless permitted_error?(path, exception)
-
-        default_return
-      end
-
-      # Check if a specific exception has been whitelisted for specified path
-      #
-      # @param path [Pathname] file which produced the error
-      # @param exception [Exception] rescued exception to check
-      #
-      # @return [Boolean]
-      def permitted_error?(path, exception)
-        original = exception.cause || exception
-
-        error =
-          PermittedError.new(
-            path:  path.relative_path_from(repo_path),
-            error: original.inspect
-          )
-
-        permitted_errors.include?(error)
       end
 
       # Install mutant
@@ -255,18 +243,52 @@ module MutantSpec
         end
       end
 
-      class PermittedError
-        include Anima.new(:path, :error)
+      # Mapping of files which we expect to cause errors during mutation generation
+      class ErrorWhitelist
+        UnnecessaryExpectation = Class.new(StandardError)
+        UNNECESSARY_EXPECTATION = 'Expected to encounter %s while mutating "%s"'.freeze
 
-        # Initialize a permitted error
+        include Concord.new(:map), Adamantium
+
+        # Assert that we expect to encounter the provided exception for this path
         #
-        # @param options [Hash]
+        # @param path [Pathname]
+        # @param exception [Exception]
+        #
+        # @raise provided exception if we are not expecting this error
+        #
+        # This method is reraising exceptions but rubocop can't tell
+        # rubocop:disable Style/SignalException
         #
         # @return [undefined]
-        def initialize(options)
-          super(options.merge(path: Pathname.new(options.fetch(:path))))
+        def assert_error(path, exception)
+          original_error = exception.cause || exception
+
+          raise exception unless map[path].eql?(original_error.inspect)
         end
-      end # PermittedError
+
+        # Assert that we expect to not encounter an error for the specified path
+        #
+        # @param path [Pathname]
+        #
+        # @raise [UnnecessaryExpectation] if we are expecting an exception for this path
+        #
+        # @return [undefined]
+        def assert_success(path)
+          return unless map.key?(path)
+
+          fail UnnecessaryExpectation, UNNECESSARY_EXPECTATION % [map.fetch(path), path]
+        end
+
+        # Return representation as hash
+        #
+        # @note this method is necessary for morpher loader to be invertible
+        #
+        # @return [Hash{Pathname => String}]
+        def to_h
+          map
+        end
+      end # ErrorWhitelist
 
       # rubocop:disable ClosingParenthesisIndentation
       LOADER = Morpher.build do
@@ -284,21 +306,16 @@ module MutantSpec
                   s(:guard, s(:or, s(:primitive, TrueClass), s(:primitive, FalseClass)))),
                 s(:key_symbolize, :mutation_generation,
                   s(:guard, s(:or, s(:primitive, TrueClass), s(:primitive, FalseClass)))),
-                s(:key_symbolize, :permitted_errors,
-                  s(:map,
-                    s(:block,
-                      s(:guard, s(:primitive, Hash)),
-                      s(:hash_transform,
-                        s(:key_symbolize, :path, s(:guard, s(:primitive, String))),
-                        s(:key_symbolize, :error, s(:guard, s(:primitive, String)))
-                      ),
-                      s(:load_attribute_hash,
-                        Morpher::Evaluator::Transformer::Domain::Param.new(
-                          PermittedError,
-                          %i[path error]
-                        )
-                      )
-                    )
+                s(:key_symbolize, :expected_errors,
+                  s(:block,
+                    s(:guard, s(:primitive, Hash)),
+                    s(:custom,
+                      [
+                        ->(hash) { hash.map { |key, value| [Pathname.new(key), value] }.to_h  },
+                        ->(hash) { hash.map { |key, value| [key.to_s,          value] }.to_h  }
+                      ]
+                    ),
+                    s(:load_attribute_hash, s(:param, ErrorWhitelist))
                   )
                 )
               ),
@@ -306,7 +323,7 @@ module MutantSpec
                 # NOTE: The domain param has no DSL currently!
                 Morpher::Evaluator::Transformer::Domain::Param.new(
                   Project,
-                  %i[repo_uri name permitted_errors mutation_coverage mutation_generation]
+                  %i[repo_uri name expected_errors mutation_coverage mutation_generation]
                 )
               )
             )
