@@ -29,9 +29,11 @@ module MutantSpec
       START_MESSAGE               = 'Starting - %s'.freeze
       FINISH_MESSAGE              = 'Mutations - %4i - %s'.freeze
 
+      DEFAULT_MUTATION_COUNT = 0
+
       include Adamantium, Anima.new(
-        :exclude,
         :expect_coverage,
+        :permitted_errors,
         :mutation_coverage,
         :mutation_generation,
         :name,
@@ -80,21 +82,11 @@ module MutantSpec
           start:        method(:start),
           in_processes: parallel_processes
         }
+
         total = Parallel.map(effective_ruby_paths, options) do |path|
-          count = 0
-          node =
-            begin
-              Parser::CurrentRuby.parse(path.read)
-            rescue EncodingError, ArgumentError
-              nil # Make rubocop happy
-            end
-
-          if node
-            count += Mutant::Mutator::REGISTRY.call(node).length
-          end
-
-          count
+          filter_exceptions(path, DEFAULT_MUTATION_COUNT) { count_mutations(path) }
         end.inject(0, :+)
+
         took = Time.now - start
         puts MUTATION_GENERATION_MESSAGE % [total, took, total / took]
         self
@@ -124,6 +116,52 @@ module MutantSpec
 
     private
 
+      # Count mutations generated for provided source file
+      #
+      # @param path [Pathname] path to a source file
+      #
+      # @return [Fixnum] number of mutations generated
+      def count_mutations(path)
+        node = Parser::CurrentRuby.parse(path.read)
+
+        return DEFAULT_MUTATION_COUNT unless node
+
+        Mutant::Mutator::REGISTRY.call(node).length
+      end
+
+      # Yield and conditionally suppress errors according to whitelist
+      #
+      # @param path [Pathname] path responsible for exception
+      # @param default_return [Object] return value if exception is permitted
+      #
+      # @return value returned from yield if no exception raised
+      # @return `default_return` otherwise
+      def filter_exceptions(path, default_return)
+        yield
+      rescue Exception => exception # rubocop:disable Lint/RescueException
+        raise exception unless permitted_error?(path, exception)
+
+        default_return
+      end
+
+      # Check if a specific exception has been whitelisted for specified path
+      #
+      # @param path [Pathname] file which produced the error
+      # @param exception [Exception] rescued exception to check
+      #
+      # @return [Boolean]
+      def permitted_error?(path, exception)
+        original = exception.cause || exception
+
+        error =
+          PermittedError.new(
+            path:  path.relative_path_from(repo_path),
+            error: original.inspect
+          )
+
+        permitted_errors.include?(error)
+      end
+
       # Install mutant
       #
       # @return [undefined]
@@ -144,19 +182,10 @@ module MutantSpec
       #
       # @return [Array<Pathname>]
       def effective_ruby_paths
-        paths = Pathname
+        Pathname
           .glob(repo_path.join(RUBY_GLOB_PATTERN))
           .sort_by(&:size)
           .reverse
-
-        paths - excluded_paths
-      end
-
-      # The excluded file paths
-      #
-      # @return [Array<Pathname>]
-      def excluded_paths
-        Pathname.glob(repo_path.join(EXCLUDE_GLOB_FORMAT % exclude.join(',')))
       end
 
       # Number of parallel processes to use
@@ -226,6 +255,19 @@ module MutantSpec
         end
       end
 
+      class PermittedError
+        include Anima.new(:path, :error)
+
+        # Initialize a permitted error
+        #
+        # @param options [Hash]
+        #
+        # @return [undefined]
+        def initialize(options)
+          super(options.merge(path: Pathname.new(options.fetch(:path))))
+        end
+      end # PermittedError
+
       # rubocop:disable ClosingParenthesisIndentation
       LOADER = Morpher.build do
         s(:block,
@@ -242,13 +284,29 @@ module MutantSpec
                   s(:guard, s(:or, s(:primitive, TrueClass), s(:primitive, FalseClass)))),
                 s(:key_symbolize, :mutation_generation,
                   s(:guard, s(:or, s(:primitive, TrueClass), s(:primitive, FalseClass)))),
-                s(:key_symbolize, :exclude,             s(:map, s(:guard, s(:primitive, String))))
+                s(:key_symbolize, :permitted_errors,
+                  s(:map,
+                    s(:block,
+                      s(:guard, s(:primitive, Hash)),
+                      s(:hash_transform,
+                        s(:key_symbolize, :path, s(:guard, s(:primitive, String))),
+                        s(:key_symbolize, :error, s(:guard, s(:primitive, String)))
+                      ),
+                      s(:load_attribute_hash,
+                        Morpher::Evaluator::Transformer::Domain::Param.new(
+                          PermittedError,
+                          %i[path error]
+                        )
+                      )
+                    )
+                  )
+                )
               ),
               s(:load_attribute_hash,
                 # NOTE: The domain param has no DSL currently!
                 Morpher::Evaluator::Transformer::Domain::Param.new(
                   Project,
-                  %i[repo_uri name exclude mutation_coverage mutation_generation]
+                  %i[repo_uri name permitted_errors mutation_coverage mutation_generation]
                 )
               )
             )
